@@ -1,0 +1,5 @@
+{
+  "name": "智剪 AI 导演",
+  "description": "智能视频序列编排工具，利用 Gemini AI 根据文件名和时长约束，将您的素材排列成有逻辑的叙事视频。",
+  "requestFramePermissions": []
+}
