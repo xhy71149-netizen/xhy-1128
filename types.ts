@@ -1,3 +1,4 @@
+
 export interface VideoClip {
   id: string;
   file: File;
@@ -11,8 +12,17 @@ export interface SequenceConfig {
   maxDuration: number;
 }
 
+export interface TimelineItem {
+  clip: VideoClip;
+  cutDuration: number; // The duration AI decided for this clip (in seconds)
+  reasoning?: string; // Why this clip is here
+}
+
 export interface GeneratedSequence {
-  clips: VideoClip[];
+  id: string; // Unique ID for this specific generation result
+  bgmName?: string; // Name of the BGM used for this sequence
+  bgmFile?: File; // The actual BGM file
+  timeline: TimelineItem[];
   totalDuration: number;
   narrativeReasoning: string;
   title: string;

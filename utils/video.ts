@@ -1,4 +1,4 @@
-import { VideoClip } from '../types';
+import { VideoClip, TimelineItem } from '../types';
 
 export const getVideoDuration = (file: File): Promise<number> => {
   return new Promise((resolve, reject) => {
@@ -48,50 +48,103 @@ export const formatDuration = (seconds: number): string => {
 };
 
 /**
- * Concatenates video clips into a single blob using Canvas and MediaRecorder.
- * This runs client-side and records the sequence in real-time (fast-forward not reliably supported by all browsers).
+ * Concatenates video clips into a single blob using Canvas, Web Audio API and MediaRecorder.
+ * Handles BGM mixing, muting original clips, and fade effects.
+ * Optimized for 60fps and frame accuracy.
  */
-export const concatVideos = async (clips: VideoClip[], onProgress: (progress: number) => void): Promise<Blob> => {
-  if (clips.length === 0) throw new Error("没有可合成的视频片段");
+export const concatVideos = async (
+  timeline: TimelineItem[], 
+  bgmFile: File | null,
+  useGPU: boolean,
+  onProgress: (progress: number) => void
+): Promise<Blob> => {
+  if (timeline.length === 0) throw new Error("没有可合成的视频片段");
 
   const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  const video = document.createElement('video');
-  video.muted = true; // Required for auto-play in some contexts
-  video.playsInline = true;
-  video.crossOrigin = "anonymous";
+  // Optimize context for frequent reads/writes
+  const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
   
-  // Set resolution to 1080x1920 (9:16 aspect ratio) as requested
+  // Set resolution to 1080x1920 (9:16 aspect ratio)
   canvas.width = 1080; 
   canvas.height = 1920;
 
-  // 60 FPS recording
-  const stream = canvas.captureStream(60);
-  // Prefer VP9 for better quality/size ratio, fallback to standard webm
-  const mimeType = MediaRecorder.isTypeSupported('video/webm; codecs=vp9') 
-    ? 'video/webm; codecs=vp9' 
-    : 'video/webm';
+  // Setup Audio Context for BGM
+  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+  const dest = audioCtx.createMediaStreamDestination();
+  const gainNode = audioCtx.createGain();
+  
+  // Configure Fade Effects (1.5s)
+  const totalDuration = timeline.reduce((acc, item) => acc + item.cutDuration, 0);
+  const fadeDuration = 1.5;
+
+  gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+  gainNode.gain.linearRampToValueAtTime(1, audioCtx.currentTime + fadeDuration);
+  gainNode.gain.setValueAtTime(1, audioCtx.currentTime + totalDuration - fadeDuration);
+  gainNode.gain.linearRampToValueAtTime(0, audioCtx.currentTime + totalDuration);
+
+  gainNode.connect(dest);
+
+  // Load and decode BGM
+  if (bgmFile) {
+    const arrayBuffer = await bgmFile.arrayBuffer();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    const source = audioCtx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(gainNode);
+    source.start(0); // Start playing BGM immediately in the context timeline
+  }
+
+  // Combine Canvas Video + BGM Audio
+  // Capture at 60 FPS strictly
+  const canvasStream = canvas.captureStream(60);
+  
+  // Merge audio tracks if BGM exists, otherwise just video
+  const tracks = [
+    ...canvasStream.getVideoTracks(),
+    ...dest.stream.getAudioTracks()
+  ];
+  const combinedStream = new MediaStream(tracks);
+
+  let mimeType = 'video/webm';
+  if (useGPU && MediaRecorder.isTypeSupported('video/webm; codecs=h264')) {
+      mimeType = 'video/webm; codecs=h264';
+  } else if (MediaRecorder.isTypeSupported('video/webm; codecs=vp9')) {
+      mimeType = 'video/webm; codecs=vp9';
+  }
     
-  const mediaRecorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 8000000 }); // Increased bitrate for 60fps/1080p
+  // High bitrate for 1080p 60fps to prevent compression artifacts
+  const mediaRecorder = new MediaRecorder(combinedStream, { 
+    mimeType, 
+    videoBitsPerSecond: 25000000 // 25 Mbps
+  });
+  
   const chunks: Blob[] = [];
 
   mediaRecorder.ondataavailable = (e) => {
     if (e.data.size > 0) chunks.push(e.data);
   };
 
+  // Start recording
   mediaRecorder.start();
 
-  const totalDuration = clips.reduce((acc, c) => acc + c.duration, 0);
+  const video = document.createElement('video');
+  video.muted = true; // IMPORTANT: Mute original video
+  video.playsInline = true;
+  video.crossOrigin = "anonymous";
+
   let processedDuration = 0;
 
-  // Helper to play a single clip and draw to canvas
-  const playClip = async (clip: VideoClip) => {
+  // Helper to play a single clip segment
+  const playClipSegment = async (item: TimelineItem) => {
     return new Promise<void>((resolve, reject) => {
+      const { clip, cutDuration } = item;
       video.src = clip.url;
       
       video.onloadedmetadata = () => {
-        // Calculate aspect ratio fit (contain)
-        // This ensures the video fits within the 9:16 canvas, adding black bars if necessary
+        // Resume recording components when video is ready
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        if (mediaRecorder.state === 'paused') mediaRecorder.resume();
+
         const scale = Math.min(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
         const w = video.videoWidth * scale;
         const h = video.videoHeight * scale;
@@ -100,39 +153,55 @@ export const concatVideos = async (clips: VideoClip[], onProgress: (progress: nu
 
         const drawFrame = () => {
           if (video.paused || video.ended) return;
-          
+
+          // Use video.currentTime to strictly track content consumption.
+          // This ensures we capture the exact amount of video content intended, 
+          // even if rendering lags slightly (preserving frames).
+          if (video.currentTime >= cutDuration) {
+             video.pause();
+             resolve();
+             return;
+          }
+
           if (ctx) {
-            // Black background
             ctx.fillStyle = '#000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
-            // Draw video
             ctx.drawImage(video, x, y, w, h);
           }
 
           const currentTotal = processedDuration + video.currentTime;
-          const progress = Math.min(currentTotal / totalDuration, 0.99);
-          onProgress(progress);
+          onProgress(Math.min(currentTotal / totalDuration, 0.99));
           
-          requestAnimationFrame(drawFrame);
+          // Prefer requestVideoFrameCallback for frame-perfect rendering
+          if ('requestVideoFrameCallback' in video) {
+            (video as any).requestVideoFrameCallback(drawFrame);
+          } else {
+            requestAnimationFrame(drawFrame);
+          }
         };
 
         video.play().then(() => {
-          drawFrame();
+          if ('requestVideoFrameCallback' in video) {
+             (video as any).requestVideoFrameCallback(drawFrame);
+          } else {
+             requestAnimationFrame(drawFrame);
+          }
         }).catch(reject);
       };
 
-      video.onended = () => {
-        processedDuration += clip.duration;
-        resolve();
-      };
-      
       video.onerror = (e) => reject(e);
     });
   };
 
   try {
-    for (const clip of clips) {
-      await playClip(clip);
+    for (const item of timeline) {
+      // Pause everything while loading the next video to keep A/V sync
+      mediaRecorder.pause();
+      await audioCtx.suspend();
+      
+      await playClipSegment(item);
+      
+      processedDuration += item.cutDuration;
     }
   } catch (err) {
     console.error("Error during rendering:", err);
@@ -144,6 +213,7 @@ export const concatVideos = async (clips: VideoClip[], onProgress: (progress: nu
   return new Promise((resolve) => {
     mediaRecorder.onstop = () => {
       onProgress(1);
+      audioCtx.close();
       const blob = new Blob(chunks, { type: 'video/webm' });
       resolve(blob);
     };
