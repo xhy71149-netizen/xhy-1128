@@ -1,3 +1,4 @@
+
 import { VideoClip, TimelineItem } from '../types';
 
 export const getVideoDuration = (file: File): Promise<number> => {
@@ -47,10 +48,18 @@ export const formatDuration = (seconds: number): string => {
   return `${m}:${s.toString().padStart(2, '0')}`;
 };
 
+// Helper to preload video metadata
+const loadVideoPromise = (video: HTMLVideoElement, url: string): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    video.src = url;
+    video.onloadedmetadata = () => resolve();
+    video.onerror = (e) => reject(new Error(`Failed to load video: ${url}`));
+  });
+};
+
 /**
  * Concatenates video clips into a single blob using Canvas, Web Audio API and MediaRecorder.
- * Handles BGM mixing, muting original clips, and fade effects.
- * Optimized for 60fps and frame accuracy.
+ * Uses Double Buffering to ensure smooth BGM playback without interruptions.
  */
 export const concatVideos = async (
   timeline: TimelineItem[], 
@@ -91,7 +100,7 @@ export const concatVideos = async (
     const source = audioCtx.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(gainNode);
-    source.start(0); // Start playing BGM immediately in the context timeline
+    source.start(0); // Start playing BGM immediately
   }
 
   // Combine Canvas Video + BGM Audio
@@ -112,7 +121,7 @@ export const concatVideos = async (
       mimeType = 'video/webm; codecs=vp9';
   }
     
-  // High bitrate for 1080p 60fps to prevent compression artifacts
+  // High bitrate for 1080p 60fps
   const mediaRecorder = new MediaRecorder(combinedStream, { 
     mimeType, 
     videoBitsPerSecond: 25000000 // 25 Mbps
@@ -124,89 +133,117 @@ export const concatVideos = async (
     if (e.data.size > 0) chunks.push(e.data);
   };
 
-  // Start recording
-  mediaRecorder.start();
+  // --- Double Buffering Setup ---
+  const v1 = document.createElement('video');
+  const v2 = document.createElement('video');
+  
+  // Configure videos
+  [v1, v2].forEach(v => {
+      v.muted = true; // IMPORTANT: Mute original video
+      v.playsInline = true;
+      v.crossOrigin = "anonymous";
+      v.width = 1080;
+      v.height = 1920;
+  });
 
-  const video = document.createElement('video');
-  video.muted = true; // IMPORTANT: Mute original video
-  video.playsInline = true;
-  video.crossOrigin = "anonymous";
-
+  let currentVideo = v1;
+  let nextVideo = v2;
   let processedDuration = 0;
 
-  // Helper to play a single clip segment
-  const playClipSegment = async (item: TimelineItem) => {
-    return new Promise<void>((resolve, reject) => {
-      const { clip, cutDuration } = item;
-      video.src = clip.url;
-      
-      video.onloadedmetadata = () => {
-        // Resume recording components when video is ready
-        if (audioCtx.state === 'suspended') audioCtx.resume();
-        if (mediaRecorder.state === 'paused') mediaRecorder.resume();
-
-        const scale = Math.min(canvas.width / video.videoWidth, canvas.height / video.videoHeight);
-        const w = video.videoWidth * scale;
-        const h = video.videoHeight * scale;
-        const x = (canvas.width - w) / 2;
-        const y = (canvas.height - h) / 2;
-
-        const drawFrame = () => {
-          if (video.paused || video.ended) return;
-
-          // Use video.currentTime to strictly track content consumption.
-          // This ensures we capture the exact amount of video content intended, 
-          // even if rendering lags slightly (preserving frames).
-          if (video.currentTime >= cutDuration) {
-             video.pause();
-             resolve();
-             return;
-          }
-
-          if (ctx) {
-            ctx.fillStyle = '#000';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.drawImage(video, x, y, w, h);
-          }
-
-          const currentTotal = processedDuration + video.currentTime;
-          onProgress(Math.min(currentTotal / totalDuration, 0.99));
-          
-          // Prefer requestVideoFrameCallback for frame-perfect rendering
-          if ('requestVideoFrameCallback' in video) {
-            (video as any).requestVideoFrameCallback(drawFrame);
-          } else {
-            requestAnimationFrame(drawFrame);
-          }
-        };
-
-        video.play().then(() => {
-          if ('requestVideoFrameCallback' in video) {
-             (video as any).requestVideoFrameCallback(drawFrame);
-          } else {
-             requestAnimationFrame(drawFrame);
-          }
-        }).catch(reject);
-      };
-
-      video.onerror = (e) => reject(e);
-    });
-  };
+  // Start recording
+  mediaRecorder.start();
+  // Ensure audio is running (some browsers start suspended)
+  if (audioCtx.state === 'suspended') {
+      await audioCtx.resume();
+  }
 
   try {
-    for (const item of timeline) {
-      // Pause everything while loading the next video to keep A/V sync
-      mediaRecorder.pause();
-      await audioCtx.suspend();
+      // 1. Initial Load
+      await loadVideoPromise(currentVideo, timeline[0].clip.url);
       
-      await playClipSegment(item);
-      
-      processedDuration += item.cutDuration;
-    }
+      let nextVideoPromise: Promise<void> | null = null;
+      if (timeline.length > 1) {
+          nextVideoPromise = loadVideoPromise(nextVideo, timeline[1].clip.url);
+      }
+
+      for (let i = 0; i < timeline.length; i++) {
+          const item = timeline[i];
+          const duration = item.cutDuration;
+
+          // Play current video
+          await new Promise<void>((resolve, reject) => {
+              const playPromise = currentVideo.play();
+              if (playPromise) playPromise.catch(reject);
+
+              const drawFrame = () => {
+                  if (currentVideo.paused || currentVideo.ended) return;
+
+                  // Render to canvas
+                  if (ctx) {
+                      const scale = Math.min(canvas.width / currentVideo.videoWidth, canvas.height / currentVideo.videoHeight);
+                      const w = currentVideo.videoWidth * scale;
+                      const h = currentVideo.videoHeight * scale;
+                      const x = (canvas.width - w) / 2;
+                      const y = (canvas.height - h) / 2;
+
+                      ctx.fillStyle = '#000';
+                      ctx.fillRect(0, 0, canvas.width, canvas.height);
+                      ctx.drawImage(currentVideo, x, y, w, h);
+                  }
+
+                  const currentTime = currentVideo.currentTime;
+                  // Update progress
+                  onProgress(Math.min((processedDuration + currentTime) / totalDuration, 0.99));
+
+                  // Check if cut duration reached
+                  if (currentTime >= duration) {
+                      currentVideo.pause();
+                      resolve();
+                  } else {
+                      if ('requestVideoFrameCallback' in currentVideo) {
+                          (currentVideo as any).requestVideoFrameCallback(drawFrame);
+                      } else {
+                          requestAnimationFrame(drawFrame);
+                      }
+                  }
+              };
+
+              if ('requestVideoFrameCallback' in currentVideo) {
+                  (currentVideo as any).requestVideoFrameCallback(drawFrame);
+              } else {
+                  requestAnimationFrame(drawFrame);
+              }
+          });
+
+          processedDuration += duration;
+
+          // Prepare for next clip
+          if (i < timeline.length - 1) {
+              // Wait for next video ONLY if it hasn't loaded yet.
+              // We do NOT pause MediaRecorder/AudioContext here to ensure smooth BGM.
+              // If loading is slow, the canvas will hold the last frame (freeze) but audio continues.
+              // Double buffering makes freezing very unlikely for local files.
+              if (nextVideoPromise) {
+                  await nextVideoPromise;
+              }
+
+              // Swap buffers
+              [currentVideo, nextVideo] = [nextVideo, currentVideo];
+
+              // Preload i + 2
+              if (i + 2 < timeline.length) {
+                  nextVideoPromise = loadVideoPromise(nextVideo, timeline[i + 2].clip.url);
+              } else {
+                  nextVideoPromise = null;
+              }
+          }
+      }
+
   } catch (err) {
-    console.error("Error during rendering:", err);
-    mediaRecorder.stop();
-    throw err;
+      console.error("Error during rendering:", err);
+      mediaRecorder.stop();
+      audioCtx.close();
+      throw err;
   }
 
   // Finalize
